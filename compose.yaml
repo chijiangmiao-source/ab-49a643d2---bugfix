@@ -1,0 +1,55 @@
+name: cryocal
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: cryocal-api:latest
+    environment:
+      DATABASE_PATH: /data/calibration.db
+    volumes:
+      - calib_data:/data
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+    restart: unless-stopped
+
+  web:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+      - ./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 一次性验收服务：复现级联失效与并发竞争不变量，
+  # 完成代码测试、构建检查及 API/HTTP 冒烟后以退出码报告结果。
+  verify:
+    image: cryocal-api:latest
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: ["python", "-m", "verify.run"]
+    environment:
+      API_BASE_URL: http://api:8000
+      WEB_BASE_URL: http://web
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: "no"
+
+volumes:
+  calib_data:

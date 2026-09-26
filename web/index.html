@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>低温探测器标定记录</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>低温探测器标定记录</h1>
+      <p class="subtitle">原始读数 · 推导结论 · 级联失效裁决</p>
+    </div>
+    <div id="health" class="health unknown">健康检查…</div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>新建原始记录</h2>
+      <form id="form-raw">
+        <div class="field-row">
+          <label>探测器
+            <input name="detector" required value="TES-01" maxlength="120">
+          </label>
+          <label>读数 (mK)
+            <input name="reading_mk" type="number" step="any" min="0" value="100">
+          </label>
+        </div>
+        <label>摘要
+          <input name="summary" required placeholder="例如：100mK 基底读数" maxlength="2000">
+        </label>
+        <button type="submit">提交原始记录</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>新建推导记录</h2>
+      <form id="form-derived">
+        <div class="field-row">
+          <label>探测器
+            <input name="detector" required value="TES-01" maxlength="120">
+          </label>
+          <label>结论摘要
+            <input name="summary" required placeholder="例如：噪声等效功率标定" maxlength="2000">
+          </label>
+        </div>
+        <div class="dep-picker">
+          <span class="dep-label">选择前序依据（可多项，仅列出当前有效记录）：</span>
+          <div id="dep-options" class="dep-options"></div>
+        </div>
+        <button type="submit">提交推导记录</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>记录列表</h2>
+        <button id="btn-refresh" type="button" class="secondary">刷新</button>
+      </div>
+      <div class="table-wrap">
+        <table id="records-table">
+          <thead>
+            <tr>
+              <th>编号</th><th>类型</th><th>探测器</th><th>摘要</th><th>状态</th>
+              <th>直接依据</th><th>失效来源</th><th>创建时间</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint">点击编号可查看谱系；失效裁决需输入操作标识（相同标识重复提交返回首次结果，改换目标将冲突）。</p>
+    </section>
+
+    <section class="card" id="panel-result" hidden>
+      <h2 id="panel-result-title">操作结果</h2>
+      <pre id="panel-result-body"></pre>
+    </section>
+
+    <section class="card error" id="panel-error" hidden>
+      <h2>错误反馈</h2>
+      <pre id="panel-error-body"></pre>
+    </section>
+
+    <section class="card" id="panel-lineage" hidden>
+      <h2>谱系详情 <span id="lineage-id" class="mono"></span></h2>
+      <div id="lineage-body"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
