@@ -129,14 +129,39 @@ def run_smoke(api_base: str, web_base: str | None) -> bool:
                  conflict.text)
         ck.check("冲突不改变状态", c.get(f"/api/records/{R2}").json()["valid"] is True)
 
-        # --- 引用已失效记录 ---
+        # --- 引用已失效记录：已使用依据 → 失效 → 再次推导的顺序场景 ---
+        ids_before = {r["id"] for r in c.get("/api/records").json()["records"]}
+        dependents_before = c.get(f"/api/records/{R1}/lineage").json()["direct_dependents"]
         depinv = c.post("/api/records", json={
-            "kind": "derived", "detector": "TES-01", "summary": "x", "depends_on": [R1],
+            "kind": "derived", "detector": "TES-01",
+            "summary": "失效后再次推导", "depends_on": [R1],
         })
-        ck.check("引用已失效记录被拒绝",
+        dbody = depinv.json()
+        ck.check("再次引用已失效依据被拒绝且反馈可定位",
                  depinv.status_code == 422
-                 and depinv.json()["error"]["code"] == "DEPENDENCY_INVALID",
+                 and dbody["error"]["code"] == "DEPENDENCY_INVALID"
+                 and dbody["error"]["details"]["invalid"]
+                 == [{"id": R1, "invalidation_root": R1}],
                  depinv.text)
+        ids_after = {r["id"] for r in c.get("/api/records").json()["records"]}
+        dependents_after = c.get(f"/api/records/{R1}/lineage").json()["direct_dependents"]
+        ck.check("拒绝不生成新记录（记录集合不变）",
+                 ids_after == ids_before, f"{len(ids_before)} -> {len(ids_after)}")
+        ck.check("拒绝不生成新依赖边（直接被引不变）",
+                 dependents_after == dependents_before,
+                 f"{dependents_before} -> {dependents_after}")
+
+        # 混合依据中部分失效同样必须拒绝且不落库
+        mix = c.post("/api/records", json={
+            "kind": "derived", "detector": "TES-01",
+            "summary": "部分失效混合依据", "depends_on": [R2, R1],
+        })
+        ck.check("混合依据含失效项被拒绝",
+                 mix.status_code == 422
+                 and mix.json()["error"]["code"] == "DEPENDENCY_INVALID",
+                 mix.text)
+        ck.check("混合依据拒绝同样不落库",
+                 {r["id"] for r in c.get("/api/records").json()["records"]} == ids_after)
 
         # --- 自引用（预测下一编号） ---
         seqs = [r["seq"] for r in c.get("/api/records").json()["records"]]

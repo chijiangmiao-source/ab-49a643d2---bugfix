@@ -126,10 +126,16 @@ def _fetch_record(conn, record_id: str):
     return conn.execute("SELECT * FROM records WHERE id = ?", (record_id,)).fetchone()
 
 
-def _validate_dependencies(db: Database, deps: list[str]) -> None:
+def _validate_dependencies(db: Database, conn, deps: list[str]) -> None:
+    """在写事务内校验依据：必须全部存在且当前有效。
+
+    必须在 ``BEGIN IMMEDIATE`` 之后调用：本事务持有写锁期间，任何
+    失效裁决都无法提交，因此这里读到的有效性与随后插入依赖边时的
+    状态完全一致，消除“先判有效、后被裁决”的竞争窗口。
+    """
     if not deps:
         return
-    existing = db.dependency_statuses(deps)
+    existing = db.dependency_statuses(conn, deps)
     missing = [dep for dep in deps if dep not in existing]
     if missing:
         raise ApiError(
@@ -176,19 +182,22 @@ def create_record(
             {},
         )
 
-    _validate_dependencies(db, deps)
-
     with db.write() as conn:
         seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS s FROM records").fetchone()["s"]
         record_id = f"CAL-{seq:06d}"
 
         # 自引用：依赖列表中出现即将分配的编号（客户端可能预测下一编号）。
+        # 须先于存在性校验——该编号此刻尚不存在，但绝不能落成自环。
         if record_id in deps:
             raise ApiError(
                 422, "SELF_REFERENCE",
                 "记录不能以自身作为依据（自引用）",
                 {"record_id": record_id},
             )
+
+        # 依据的存在性与有效性在写事务内重新校验：持锁期间裁决无法
+        # 提交，校验结论与依赖边落盘严格一致（见 _validate_dependencies）。
+        _validate_dependencies(db, conn, deps)
 
         # 防御性环检测：新边加入后若形成经过新节点的环则拒绝。
         edges = _dependency_edges(conn)

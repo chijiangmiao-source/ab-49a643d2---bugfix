@@ -5,6 +5,8 @@
 - 写事务使用 ``BEGIN IMMEDIATE``，在提交前独占数据库文件，
   因此“创建推导记录”与“失效裁决”两个事务绝不会交错，
   竞争不变量（有效记录不得依赖失效记录）由串行化天然保证；
+- 依据有效性始终从事务内实时读取，不做跨事务缓存，失效裁决一旦
+  提交，后续推导立即看到依据失效；
 - 所有变更（记录、依赖边、失效标记、操作流水）都在同一个
   持久化提交中落盘，重启后状态可完整恢复。
 """
@@ -61,7 +63,6 @@ class Database:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=15000")
-        self._dependency_state: dict[str, tuple[bool, str | None]] = {}
         with self._lock:
             self._conn.executescript(SCHEMA)
 
@@ -70,22 +71,25 @@ class Database:
         with self._lock:
             yield self._conn
 
-    def dependency_statuses(self, record_ids: list[str]) -> dict[str, tuple[bool, str | None]]:
-        with self._lock:
-            unknown = [record_id for record_id in record_ids if record_id not in self._dependency_state]
-            if unknown:
-                marks = ",".join("?" for _ in unknown)
-                for row in self._conn.execute(
-                    f"SELECT id, valid, invalidation_root FROM records WHERE id IN ({marks})", unknown
-                ):
-                    self._dependency_state[row["id"]] = (
-                        bool(row["valid"]), row["invalidation_root"]
-                    )
-            return {
-                record_id: self._dependency_state[record_id]
-                for record_id in record_ids
-                if record_id in self._dependency_state
-            }
+    def dependency_statuses(
+        self, conn: sqlite3.Connection, record_ids: list[str]
+    ) -> dict[str, tuple[bool, str | None]]:
+        """在给定事务连接上读取依据记录的当前状态。
+
+        状态直接来自当前事务可见的最新数据，不做跨事务缓存——
+        失效裁决提交后，任何后续创建都必然读到 invalid，避免陈旧
+        缓存导致“有效结论依赖失效记录”。
+        """
+        if not record_ids:
+            return {}
+        ids = list(dict.fromkeys(record_ids))
+        marks = ",".join("?" for _ in ids)
+        return {
+            row["id"]: (bool(row["valid"]), row["invalidation_root"])
+            for row in conn.execute(
+                f"SELECT id, valid, invalidation_root FROM records WHERE id IN ({marks})", ids
+            )
+        }
 
     @contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:
