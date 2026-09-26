@@ -1,5 +1,12 @@
 """失效裁决：级联、幂等重放、操作标识冲突。"""
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+from fastapi.testclient import TestClient
+
+from app.main import create_app
+
 
 def _invalidate(client, record_id, op):
     return client.post(f"/api/records/{record_id}/invalidate", json={"operation_id": op})
@@ -103,3 +110,135 @@ def test_lineage_endpoint(client, make_raw, make_derived):
     assert lin["direct_dependencies"] == [r1["id"]]
     assert lin["direct_dependents"] == [b["id"]]
     assert client.get("/api/records/CAL-000099/lineage").status_code == 404
+
+
+def test_used_basis_invalidated_then_derivation_rejected(client, make_raw, make_derived):
+    # 场景：原始读数 → 已被引用的推导 → 失效裁决（级联）→ 再次推导必须被拒绝。
+    raw = make_raw()
+    first = make_derived([raw["id"]])
+    count_before = len(client.get("/api/records").json()["records"])
+
+    inv = _invalidate(client, raw["id"], "op-used-basis")
+    assert inv.status_code == 200
+    assert inv.json()["invalidated"] == [raw["id"], first["id"]]
+
+    resp = client.post("/api/records", json={
+        "kind": "derived", "detector": "TES-01",
+        "summary": "裁决后再次引用失效读数", "depends_on": [raw["id"]],
+    })
+    # 拒绝并给出可定位的失效依据
+    assert resp.status_code == 422
+    err = resp.json()["error"]
+    assert err["code"] == "DEPENDENCY_INVALID"
+    assert err["details"]["invalid"] == [{
+        "id": raw["id"],
+        "invalidation_root": raw["id"],
+        "invalidated_by_operation": "op-used-basis",
+    }]
+
+    # 不生成任何新记录
+    records = client.get("/api/records").json()["records"]
+    assert len(records) == count_before
+    by_id = {r["id"]: r for r in records}
+    # 不生成任何新依赖边：失效读数的直接下游仍只有第一条推导
+    lin = client.get(f"/api/records/{raw['id']}/lineage").json()
+    assert lin["direct_dependents"] == [first["id"]]
+    # 编号序列未被失败的创建消耗
+    after = make_raw(detector="TES-02", summary="裁决后的新读数")
+    assert after["id"] == "CAL-000003"
+    # 列表与谱系中不存在“有效记录依赖失效记录”
+    for rec in by_id.values():
+        if rec["valid"]:
+            for dep in rec["depends_on"]:
+                assert by_id[dep]["valid"]
+    assert not by_id[raw["id"]]["valid"] and not by_id[first["id"]]["valid"]
+
+
+def test_interleaved_derivation_either_cascades_or_is_rejected(tmp_path):
+    # 推导与裁决先后交错：先完成的推导随裁决级联失效；裁决后的推导被拒绝。
+    app = create_app(str(tmp_path / "interleave.db"))
+    c = TestClient(app)
+    raw = c.post("/api/records", json={
+        "kind": "raw", "detector": "TES-01", "summary": "交错目标", "reading_mk": 1.0,
+    }).json()
+    target = raw["id"]
+
+    # 裁决之前完成的推导
+    before = c.post("/api/records", json={
+        "kind": "derived", "detector": "TES-01", "summary": "裁决前推导",
+        "depends_on": [target],
+    })
+    assert before.status_code == 201
+    before_id = before.json()["id"]
+
+    assert _invalidate(c, target, "op-interleave").status_code == 200
+
+    # 裁决之后提交的推导
+    after = c.post("/api/records", json={
+        "kind": "derived", "detector": "TES-01", "summary": "裁决后推导",
+        "depends_on": [target],
+    })
+    assert after.status_code == 422
+    assert after.json()["error"]["code"] == "DEPENDENCY_INVALID"
+
+    records = {r["id"]: r for r in c.get("/api/records").json()["records"]}
+    assert records[before_id]["valid"] is False  # 先完成者被级联失效
+    assert records[target]["valid"] is False
+    assert "裁决后推导" not in {r["summary"] for r in records.values()}  # 未落库
+    for rec in records.values():
+        if rec["valid"]:
+            assert all(records[d]["valid"] for d in rec["depends_on"])
+    app.state.db.close()
+
+
+def test_concurrent_derivation_versus_invalidation_never_contradicts(tmp_path):
+    # 并发：任意交错下要么被级联失效，要么被拒绝，绝不出现有效依赖失效。
+    app = create_app(str(tmp_path / "concurrent.db"))
+    setup = TestClient(app)
+    raw = setup.post("/api/records", json={
+        "kind": "raw", "detector": "TES-C", "summary": "并发目标", "reading_mk": 7.0,
+    }).json()
+    target = raw["id"]
+
+    total = 10
+    barrier = threading.Barrier(total)
+
+    def do_create(i):
+        cl = TestClient(app)
+        barrier.wait()
+        return cl.post("/api/records", json={
+            "kind": "derived", "detector": "TES-C",
+            "summary": f"并发推导-{i}", "depends_on": [target],
+        })
+
+    def do_invalidate():
+        cl = TestClient(app)
+        barrier.wait()
+        return cl.post(f"/api/records/{target}/invalidate",
+                       json={"operation_id": "op-concurrent"})
+
+    with ThreadPoolExecutor(max_workers=total) as pool:
+        creates = [pool.submit(do_create, i) for i in range(total - 1)]
+        invalidation = pool.submit(do_invalidate)
+        create_resps = [f.result() for f in creates]
+        inv_resp = invalidation.result()
+
+    assert inv_resp.status_code == 200
+    final = TestClient(app)
+    records = {r["id"]: r for r in final.get("/api/records").json()["records"]}
+    assert records[target]["valid"] is False
+    for resp in create_resps:
+        if resp.status_code == 201:
+            assert records[resp.json()["id"]]["valid"] is False
+        else:
+            assert resp.status_code == 422
+            assert resp.json()["error"]["code"] == "DEPENDENCY_INVALID"
+    for rec in records.values():
+        if rec["valid"]:
+            assert all(records[d]["valid"] for d in rec["depends_on"])
+    # 裁决流水可查询且可幂等重放
+    assert final.get("/api/operations/op-concurrent").status_code == 200
+    replay = final.post(f"/api/records/{target}/invalidate",
+                        json={"operation_id": "op-concurrent"})
+    assert replay.headers["X-Idempotent-Replay"] == "true"
+    app.state.db.close()

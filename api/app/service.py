@@ -126,24 +126,42 @@ def _fetch_record(conn, record_id: str):
     return conn.execute("SELECT * FROM records WHERE id = ?", (record_id,)).fetchone()
 
 
-def _validate_dependencies(db: Database, deps: list[str]) -> None:
+def _validate_dependencies(conn, deps: list[str]) -> None:
+    """在写事务内依据当前已提交状态校验依据：必须存在且全部有效。
+
+    必须在 ``BEGIN IMMEDIATE`` 事务中调用：裁决事务在此期间无法提交，
+    因而“依据有效”的判定与依赖边的插入对并发失效裁决是原子的——
+    依据若在本事务开始前被裁决失效，这里必然读到最新失效状态并拒绝。
+    """
     if not deps:
         return
-    existing = db.dependency_statuses(deps)
-    missing = [dep for dep in deps if dep not in existing]
+    marks = ",".join("?" for _ in deps)
+    rows = {
+        r["id"]: r
+        for r in conn.execute(
+            f"SELECT id, valid, invalidation_root, invalidated_by_operation"
+            f" FROM records WHERE id IN ({marks})",
+            deps,
+        )
+    }
+    missing = [dep for dep in deps if dep not in rows]
     if missing:
         raise ApiError(
             422, "DEPENDENCY_NOT_FOUND",
             "引用的前序记录不存在",
             {"missing": missing},
         )
-    invalid = [dep for dep in deps if not existing[dep][0]]
+    invalid = [dep for dep in deps if not rows[dep]["valid"]]
     if invalid:
         raise ApiError(
             422, "DEPENDENCY_INVALID",
             "引用的前序记录已失效，不能作为依据",
             {"invalid": [
-                {"id": dep, "invalidation_root": existing[dep][1]}
+                {
+                    "id": dep,
+                    "invalidation_root": rows[dep]["invalidation_root"],
+                    "invalidated_by_operation": rows[dep]["invalidated_by_operation"],
+                }
                 for dep in invalid
             ]},
         )
@@ -176,8 +194,6 @@ def create_record(
             {},
         )
 
-    _validate_dependencies(db, deps)
-
     with db.write() as conn:
         seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS s FROM records").fetchone()["s"]
         record_id = f"CAL-{seq:06d}"
@@ -189,6 +205,10 @@ def create_record(
                 "记录不能以自身作为依据（自引用）",
                 {"record_id": record_id},
             )
+
+        # 事务内重新校验依据存在性与当前有效性：与并发失效裁决串行化，
+        # 拒绝任何引用已失效记录的新推导，且本事务随 ROLLBACK 不留任何痕迹。
+        _validate_dependencies(conn, deps)
 
         # 防御性环检测：新边加入后若形成经过新节点的环则拒绝。
         edges = _dependency_edges(conn)

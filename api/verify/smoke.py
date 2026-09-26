@@ -129,14 +129,28 @@ def run_smoke(api_base: str, web_base: str | None) -> bool:
                  conflict.text)
         ck.check("冲突不改变状态", c.get(f"/api/records/{R2}").json()["valid"] is True)
 
-        # --- 引用已失效记录 ---
+        # --- 引用已失效记录：顺序场景“已使用依据 → 失效 → 再次推导” ---
+        ids_before = {r["id"] for r in c.get("/api/records").json()["records"]}
+        deps_before = c.get(f"/api/records/{R1}/lineage").json()["direct_dependents"]
         depinv = c.post("/api/records", json={
-            "kind": "derived", "detector": "TES-01", "summary": "x", "depends_on": [R1],
+            "kind": "derived", "detector": "TES-01",
+            "summary": "裁决后再次引用失效读数", "depends_on": [R1],
         })
-        ck.check("引用已失效记录被拒绝",
+        dbody = depinv.json()
+        ck.check("引用已失效记录被拒绝且给出可定位失效依据",
                  depinv.status_code == 422
-                 and depinv.json()["error"]["code"] == "DEPENDENCY_INVALID",
+                 and dbody["error"]["code"] == "DEPENDENCY_INVALID"
+                 and dbody["error"]["details"]["invalid"][0]["id"] == R1
+                 and dbody["error"]["details"]["invalid"][0]["invalidation_root"] == R1
+                 and dbody["error"]["details"]["invalid"][0]["invalidated_by_operation"]
+                 == op("cascade"),
                  depinv.text)
+        ids_after = {r["id"] for r in c.get("/api/records").json()["records"]}
+        deps_after = c.get(f"/api/records/{R1}/lineage").json()["direct_dependents"]
+        ck.check("拒绝不生成新记录", ids_after == ids_before,
+                 f"before={len(ids_before)} after={len(ids_after)}")
+        ck.check("拒绝不生成新依赖边", deps_after == deps_before,
+                 f"before={deps_before} after={deps_after}")
 
         # --- 自引用（预测下一编号） ---
         seqs = [r["seq"] for r in c.get("/api/records").json()["records"]]
